@@ -1,5 +1,7 @@
 #ifndef __AFLNET_H
 #define __AFLNET_H 1
+#define TRANS_MAP_SIZE_POW2 13
+#define TRANS_MAP_SIZE   (1 << TRANS_MAP_SIZE_POW2)
 
 #include "klist.h"
 #include "khash.h"

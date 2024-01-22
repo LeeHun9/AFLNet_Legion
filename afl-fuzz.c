@@ -153,6 +153,8 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
+EXP_ST u8* trans_bits;               /* Record for current state transtion       */
+EXP_ST u8* virgin_trans_bits[TRANS_MAP_SIZE];        /* Record yet untouched trans by fuzzing    */
 
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
@@ -231,6 +233,8 @@ static u64 total_cal_us,              /* Total calibration time (us)      */
 
 static u64 total_bitmap_size,         /* Total bit count for all bitmaps  */
            total_bitmap_entries;      /* Number of bitmaps counted        */
+static u32 total_trans_edge = 0;
+static u32 unique_trans_edge = 0;
 
 static s32 cpu_core_count;            /* CPU core count                   */
 
@@ -418,7 +422,64 @@ uint FUZZ_M3 = 0;
 double RHO_V = 1.414;
 uint NODE_SELECTION_ALGORITHM = 0;
 uint SEED_SELECTION_ALGORITHM = 0;
+static u8 has_new_trans(u8* virgin_trans_map, int* uniq_trans_num, int* trans_num);
+static void record_transbit(unsigned int *state_sequence, unsigned int state_count);
 
+void record_transbit(unsigned int *state_sequence, unsigned int state_count) {
+
+  // Initialize trans_bits to 0
+  memset(trans_bits, 0, TRANS_MAP_SIZE);
+
+  unsigned int pre_state_id = 0;
+  unsigned int state_id = 0;
+  unsigned int next_state_id = 0;
+
+  // state_sequence[0] always be 0, state_count=1 represent no trans, we do nothing
+  if (state_count == 1) {
+    //trans_bits[pre_state_id + state_sequence[0]]++;
+    return;
+  }
+
+  int i;
+
+  /* update trans_bits */
+  for (i = 1; i < state_count; i++) {
+    trans_bits[(pre_state_id + state_sequence[i])%TRANS_MAP_SIZE]++; // current state is state_sequence[i]
+    pre_state_id = state_sequence[i] * 8;   // this should be optimized later
+  }
+
+}
+
+static u8 has_new_trans(u8* virgin_trans_map, int* uniq_trans_num, int* trans_num) {
+
+  int ret = 0;
+  int tmp = 0;
+  int tmp2 = 0;
+
+  for (int i = 0; i < TRANS_MAP_SIZE; i++) {
+    if (unlikely(trans_bits[i])) {
+      tmp++;
+      tmp2 += trans_bits[i];
+
+      if (!virgin_trans_map[i]) {
+        virgin_trans_map[i] = trans_bits[i];
+        unique_trans_edge++;
+        ret = 2;
+      }
+
+      //if (virgin_trans_map[i] && virgin_trans_bits[i] < trans_bits[i]) {
+      //  virgin_trans_map[i] = trans_bits[i];
+      //  ret = 1;
+      //}
+
+      total_trans_edge += trans_bits[i];
+    }
+  }
+  *uniq_trans_num = tmp;
+  *trans_num = tmp2;
+
+  return ret;
+}
 
 // MCTS global variables
 TreeNode* ROOT;
@@ -2326,6 +2387,9 @@ EXP_ST void setup_shm(void) {
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
+  memset(virgin_trans_bits, 0, TRANS_MAP_SIZE);
+  trans_bits = ck_alloc(TRANS_MAP_SIZE);
+
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
@@ -3726,6 +3790,18 @@ static void perform_dry_run(char** argv) {
         if (q == queue) check_map_coverage();
 
         if (crash_mode) FATAL("Test case '%s' does *NOT* crash", fn);
+        unsigned int state_count;
+        u8 hnt = 0;
+        u32 uts = 0;
+        u32 ts = 0;
+
+        if (!response_buf_size || !response_bytes) break;
+
+        unsigned int *state_sequence = (*extract_response_codes)(response_buf, response_buf_size, &state_count);
+        record_transbit(state_sequence, state_count);
+        hnt = has_new_trans(virgin_trans_bits, &uts, &ts);
+
+        if (state_sequence) ck_free(state_sequence);
 
         break;
 
@@ -4108,6 +4184,9 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   u8  *fn = "";
   u8  hnb;
+  u8  hnt = 0;
+  u32 ts = 0;
+  u32 uts = 0;
   //s32 fd;
   u8  keeping = 0, res;
 
@@ -4115,6 +4194,16 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
+    
+    unsigned int state_count;
+
+    if (response_buf_size && response_bytes) {
+      unsigned int *state_sequence = (*extract_response_codes)(response_buf, response_buf_size, &state_count);
+      record_transbit(state_sequence, state_count);
+      hnt = has_new_trans(virgin_trans_bits, &uts, &ts);
+      //Free state sequence
+      if (state_sequence) ck_free(state_sequence);
+    }
 
     if (!(hnb = has_new_bits(virgin_bits))) {
       if (crash_mode) total_crashes++;
@@ -5375,7 +5464,10 @@ static void show_stats(void) {
 
 #endif /* ^HAVE_AFFINITY */
 
-  } else SAYF("\r");
+  } else SAYF("\n");
+
+  SAYF("total num of transition is : %d\n", total_trans_edge);
+  SAYF("unique num of transition is : %d\n", unique_trans_edge);
 
   /* Show debugging stats for AFLNet only when AFLNET_DEBUG environment variable is set */
   if (getenv("AFLNET_DEBUG") && (atoi(getenv("AFLNET_DEBUG")) == 1) && state_aware_mode) {
